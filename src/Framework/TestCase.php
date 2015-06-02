@@ -1,47 +1,20 @@
 <?php
-/**
- * PHPUnit
+/*
+ * This file is part of PHPUnit.
  *
- * Copyright (c) 2001-2014, Sebastian Bergmann <sebastian@phpunit.de>.
- * All rights reserved.
+ * (c) Sebastian Bergmann <sebastian@phpunit.de>
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- *
- *   * Redistributions of source code must retain the above copyright
- *     notice, this list of conditions and the following disclaimer.
- *
- *   * Redistributions in binary form must reproduce the above copyright
- *     notice, this list of conditions and the following disclaimer in
- *     the documentation and/or other materials provided with the
- *     distribution.
- *
- *   * Neither the name of Sebastian Bergmann nor the names of his
- *     contributors may be used to endorse or promote products derived
- *     from this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
- * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
- * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
- * FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
- * COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
- * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
- * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
- * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
- * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
- * ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
- *
- * @package    PHPUnit
- * @subpackage Framework
- * @author     Sebastian Bergmann <sebastian@phpunit.de>
- * @copyright  2001-2014 Sebastian Bergmann <sebastian@phpunit.de>
- * @license    http://www.opensource.org/licenses/BSD-3-Clause  The BSD 3-Clause License
- * @link       http://www.phpunit.de/
- * @since      File available since Release 2.0.0
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
  */
+
+use SebastianBergmann\GlobalState\Snapshot;
+use SebastianBergmann\GlobalState\Restorer;
+use SebastianBergmann\GlobalState\Blacklist;
+use SebastianBergmann\Diff\Differ;
+use SebastianBergmann\Exporter\Exporter;
+use Prophecy\Exception\Prediction\PredictionException;
+use Prophecy\Prophet;
 
 /**
  * A TestCase defines the fixture to run multiple tests.
@@ -90,7 +63,7 @@
  * @package    PHPUnit
  * @subpackage Framework
  * @author     Sebastian Bergmann <sebastian@phpunit.de>
- * @copyright  2001-2014 Sebastian Bergmann <sebastian@phpunit.de>
+ * @copyright  Sebastian Bergmann <sebastian@phpunit.de>
  * @license    http://www.opensource.org/licenses/BSD-3-Clause  The BSD 3-Clause License
  * @link       http://www.phpunit.de/
  * @since      Class available since Release 2.0.0
@@ -268,11 +241,6 @@ abstract class PHPUnit_Framework_TestCase extends PHPUnit_Framework_Assert imple
     private $outputExpectedString = null;
 
     /**
-     * @var bool
-     */
-    private $hasPerformedExpectationsOnOutput = false;
-
-    /**
      * @var mixed
      */
     private $outputCallback = false;
@@ -286,6 +254,21 @@ abstract class PHPUnit_Framework_TestCase extends PHPUnit_Framework_Assert imple
      * @var integer
      */
     private $outputBufferingLevel;
+
+    /**
+     * @var SebastianBergmann\GlobalState\Snapshot
+     */
+    private $snapshot;
+
+    /**
+     * @var Prophecy\Prophet
+     */
+    private $prophet;
+
+    /**
+     * @var boolean
+     */
+    private $disallowChangesToGlobalState = false;
 
     /**
      * Constructs a test case with the given name.
@@ -398,9 +381,7 @@ abstract class PHPUnit_Framework_TestCase extends PHPUnit_Framework_Assert imple
             return false;
         }
 
-        if ($this->outputExpectedString !== null ||
-            $this->outputExpectedRegex  !== null ||
-            $this->hasPerformedExpectationsOnOutput) {
+        if ($this->hasExpectationOnOutput()) {
             return false;
         }
 
@@ -441,10 +422,20 @@ abstract class PHPUnit_Framework_TestCase extends PHPUnit_Framework_Assert imple
     /**
      * @return bool
      * @since Method available since Release 3.6.5
+     * @deprecated
      */
     public function hasPerformedExpectationsOnOutput()
     {
-        return $this->hasPerformedExpectationsOnOutput;
+        return $this->hasExpectationOnOutput();
+    }
+
+    /**
+     * @return bool
+     * @since Method available since Release 4.3.3
+     */
+    public function hasExpectationOnOutput()
+    {
+        return is_string($this->outputExpectedString) || is_string($this->outputExpectedRegex);
     }
 
     /**
@@ -553,7 +544,7 @@ abstract class PHPUnit_Framework_TestCase extends PHPUnit_Framework_Assert imple
             $this->name
         );
 
-        if ($missingRequirements) {
+        if (!empty($missingRequirements)) {
             $this->markTestSkipped(implode(PHP_EOL, $missingRequirements));
         }
     }
@@ -724,29 +715,9 @@ abstract class PHPUnit_Framework_TestCase extends PHPUnit_Framework_Assert imple
     {
         $this->numAssertions = 0;
 
-        // Backup the $GLOBALS array and static attributes.
-        if ($this->runTestInSeparateProcess !== true &&
-            $this->inIsolation !== true) {
-            if ($this->backupGlobals === null ||
-                $this->backupGlobals === true) {
-                PHPUnit_Util_GlobalState::backupGlobals(
-                    $this->backupGlobalsBlacklist
-                );
-            }
-
-            if ($this->backupStaticAttributes === true) {
-                PHPUnit_Util_GlobalState::backupStaticAttributes(
-                    $this->backupStaticAttributesBlacklist
-                );
-            }
-        }
-
+        $this->snapshotGlobalState();
         $this->startOutputBuffering();
-
-        // Clean up stat cache.
         clearstatcache();
-
-        // Backup the cwd
         $currentWorkingDirectory = getcwd();
 
         $hookMethods = PHPUnit_Util_Test::getHookMethods(get_class($this));
@@ -781,6 +752,9 @@ abstract class PHPUnit_Framework_TestCase extends PHPUnit_Framework_Assert imple
             $this->status        = PHPUnit_Runner_BaseTestRunner::STATUS_SKIPPED;
             $this->statusMessage = $e->getMessage();
         } catch (PHPUnit_Framework_AssertionFailedError $e) {
+            $this->status = PHPUnit_Runner_BaseTestRunner::STATUS_FAILURE;
+            $this->statusMessage = $e->getMessage();
+        } catch (PredictionException $e) {
             $this->status        = PHPUnit_Runner_BaseTestRunner::STATUS_FAILURE;
             $this->statusMessage = $e->getMessage();
         } catch (Exception $e) {
@@ -790,6 +764,7 @@ abstract class PHPUnit_Framework_TestCase extends PHPUnit_Framework_Assert imple
 
         // Clean up the mock objects.
         $this->mockObjects = array();
+        $this->prophet     = null;
 
         // Tear down the fixture. An exception raised in tearDown() will be
         // caught and passed on when no exception was raised before.
@@ -811,30 +786,21 @@ abstract class PHPUnit_Framework_TestCase extends PHPUnit_Framework_Assert imple
             }
         }
 
-        $this->stopOutputBuffering();
+        try {
+            $this->stopOutputBuffering();
+        } catch (PHPUnit_Framework_RiskyTestError $_e) {
+            if (!isset($e)) {
+                $e = $_e;
+            }
+        }
 
-        // Clean up stat cache.
         clearstatcache();
 
-        // Restore the cwd if it was changed by the test
         if ($currentWorkingDirectory != getcwd()) {
             chdir($currentWorkingDirectory);
         }
 
-        // Restore the $GLOBALS array and static attributes.
-        if ($this->runTestInSeparateProcess !== true &&
-            $this->inIsolation !== true) {
-            if ($this->backupGlobals === null ||
-                $this->backupGlobals === true) {
-                PHPUnit_Util_GlobalState::restoreGlobals(
-                    $this->backupGlobalsBlacklist
-                );
-            }
-
-            if ($this->backupStaticAttributes === true) {
-                PHPUnit_Util_GlobalState::restoreStaticAttributes();
-            }
-        }
+        $this->restoreGlobalState();
 
         // Clean up INI settings.
         foreach ($this->iniSettings as $varName => $oldValue) {
@@ -852,13 +818,9 @@ abstract class PHPUnit_Framework_TestCase extends PHPUnit_Framework_Assert imple
         if (!isset($e)) {
             try {
                 if ($this->outputExpectedRegex !== null) {
-                    $this->hasPerformedExpectationsOnOutput = true;
                     $this->assertRegExp($this->outputExpectedRegex, $this->output);
-                    $this->outputExpectedRegex = null;
                 } elseif ($this->outputExpectedString !== null) {
-                    $this->hasPerformedExpectationsOnOutput = true;
                     $this->assertEquals($this->outputExpectedString, $this->output);
-                    $this->outputExpectedString = null;
                 }
             } catch (Exception $_e) {
                 $e = $_e;
@@ -867,6 +829,10 @@ abstract class PHPUnit_Framework_TestCase extends PHPUnit_Framework_Assert imple
 
         // Workaround for missing "finally".
         if (isset($e)) {
+            if ($e instanceof PredictionException) {
+                $e = new PHPUnit_Framework_AssertionFailedError($e->getMessage());
+            }
+
             $this->onNotSuccessfulTest($e);
         }
     }
@@ -985,6 +951,26 @@ abstract class PHPUnit_Framework_TestCase extends PHPUnit_Framework_Assert imple
 
             $mockObject->__phpunit_verify();
         }
+
+        if ($this->prophet !== null) {
+            try {
+                $this->prophet->checkPredictions();
+            } catch (Exception $e) {
+                /** Intentionally left empty */
+            }
+
+            foreach ($this->prophet->getProphecies() as $objectProphecy) {
+                foreach ($objectProphecy->getMethodProphecies() as $methodProphecies) {
+                    foreach ($methodProphecies as $methodProphecy) {
+                        $this->numAssertions += count($methodProphecy->getCheckedPredictions());
+                    }
+                }
+            }
+
+            if (isset($e)) {
+                throw $e;
+            }
+        }
     }
 
     /**
@@ -1028,6 +1014,15 @@ abstract class PHPUnit_Framework_TestCase extends PHPUnit_Framework_Assert imple
     public function setDependencyInput(array $dependencyInput)
     {
         $this->dependencyInput = $dependencyInput;
+    }
+
+    /**
+     * @param boolean $disallowChangesToGlobalState
+     * @since Method available since Release 4.6.0
+     */
+    public function setDisallowChangesToGlobalState($disallowChangesToGlobalState)
+    {
+        $this->disallowChangesToGlobalState = $disallowChangesToGlobalState;
     }
 
     /**
@@ -1212,7 +1207,7 @@ abstract class PHPUnit_Framework_TestCase extends PHPUnit_Framework_Assert imple
         $locale   = $args[1];
 
         $categories = array(
-          LC_ALL, LC_COLLATE, LC_CTYPE, LC_MONETARY, LC_NUMERIC, LC_TIME
+            LC_ALL, LC_COLLATE, LC_CTYPE, LC_MONETARY, LC_NUMERIC, LC_TIME
         );
 
         if (defined('LC_MESSAGES')) {
@@ -1229,7 +1224,7 @@ abstract class PHPUnit_Framework_TestCase extends PHPUnit_Framework_Assert imple
 
         $this->locale[$category] = setlocale($category, null);
 
-        $result = call_user_func_array( 'setlocale', $args );
+        $result = call_user_func_array('setlocale', $args);
 
         if ($result === false) {
             throw new PHPUnit_Framework_Exception(
@@ -1459,6 +1454,17 @@ abstract class PHPUnit_Framework_TestCase extends PHPUnit_Framework_Assert imple
     }
 
     /**
+     * @param string|null $classOrInterface
+     * @return \Prophecy\Prophecy\ObjectProphecy
+     * @throws \LogicException
+     * @since  Method available since Release 4.5.0
+     */
+    protected function prophesize($classOrInterface = null)
+    {
+        return $this->getProphet()->prophesize($classOrInterface);
+    }
+
+    /**
      * Adds a value to the assertion counter.
      *
      * @param integer $count
@@ -1481,8 +1487,8 @@ abstract class PHPUnit_Framework_TestCase extends PHPUnit_Framework_Assert imple
     }
 
     /**
-     * Returns a matcher that matches when the method it is evaluated for
-     * is executed zero or more times.
+     * Returns a matcher that matches when the method is executed
+     * zero or more times.
      *
      * @return PHPUnit_Framework_MockObject_Matcher_AnyInvokedCount
      * @since  Method available since Release 3.0.0
@@ -1493,8 +1499,7 @@ abstract class PHPUnit_Framework_TestCase extends PHPUnit_Framework_Assert imple
     }
 
     /**
-     * Returns a matcher that matches when the method it is evaluated for
-     * is never executed.
+     * Returns a matcher that matches when the method is never executed.
      *
      * @return PHPUnit_Framework_MockObject_Matcher_InvokedCount
      * @since  Method available since Release 3.0.0
@@ -1505,8 +1510,8 @@ abstract class PHPUnit_Framework_TestCase extends PHPUnit_Framework_Assert imple
     }
 
     /**
-     * Returns a matcher that matches when the method it is evaluated for
-     * is executed at least N times.
+     * Returns a matcher that matches when the method is executed
+     * at least N times.
      *
      * @param  integer $requiredInvocations
      * @return PHPUnit_Framework_MockObject_Matcher_InvokedAtLeastCount
@@ -1520,8 +1525,7 @@ abstract class PHPUnit_Framework_TestCase extends PHPUnit_Framework_Assert imple
     }
 
     /**
-     * Returns a matcher that matches when the method it is evaluated for
-     * is executed at least once.
+     * Returns a matcher that matches when the method is executed at least once.
      *
      * @return PHPUnit_Framework_MockObject_Matcher_InvokedAtLeastOnce
      * @since  Method available since Release 3.0.0
@@ -1532,8 +1536,7 @@ abstract class PHPUnit_Framework_TestCase extends PHPUnit_Framework_Assert imple
     }
 
     /**
-     * Returns a matcher that matches when the method it is evaluated for
-     * is executed exactly once.
+     * Returns a matcher that matches when the method is executed exactly once.
      *
      * @return PHPUnit_Framework_MockObject_Matcher_InvokedCount
      * @since  Method available since Release 3.0.0
@@ -1544,8 +1547,8 @@ abstract class PHPUnit_Framework_TestCase extends PHPUnit_Framework_Assert imple
     }
 
     /**
-     * Returns a matcher that matches when the method it is evaluated for
-     * is executed exactly $count times.
+     * Returns a matcher that matches when the method is executed
+     * exactly $count times.
      *
      * @param  integer                                           $count
      * @return PHPUnit_Framework_MockObject_Matcher_InvokedCount
@@ -1557,8 +1560,8 @@ abstract class PHPUnit_Framework_TestCase extends PHPUnit_Framework_Assert imple
     }
 
     /**
-     * Returns a matcher that matches when the method it is evaluated for
-     * is executed at most N times.
+     * Returns a matcher that matches when the method is executed
+     * at most N times.
      *
      * @param  integer $allowedInvocations
      * @return PHPUnit_Framework_MockObject_Matcher_InvokedAtMostCount
@@ -1572,8 +1575,8 @@ abstract class PHPUnit_Framework_TestCase extends PHPUnit_Framework_Assert imple
     }
 
     /**
-     * Returns a matcher that matches when the method it is evaluated for
-     * is invoked at the given $index.
+     * Returns a matcher that matches when the method is executed
+     * at the given index.
      *
      * @param  integer                                             $index
      * @return PHPUnit_Framework_MockObject_Matcher_InvokedAtIndex
@@ -1672,50 +1675,6 @@ abstract class PHPUnit_Framework_TestCase extends PHPUnit_Framework_Assert imple
     }
 
     /**
-     * @param  mixed  $data
-     * @return string
-     * @since  Method available since Release 3.2.1
-     */
-    protected function dataToString($data)
-    {
-        $result = array();
-
-        set_error_handler(function ($errno, $errstr, $errfile, $errline) {
-            throw new ErrorException($errstr, $errno, $errno, $errfile, $errline);
-        }, E_WARNING);
-
-        foreach ($data as $key => $_data) {
-            try {
-                // Detect array-recursions by using count
-                // http://php.net/manual/en/function.count.php
-                $iRecursiveCheck = count($_data, COUNT_RECURSIVE);
-
-                if (is_array($_data)) {
-                    $result[] = 'array(' . $this->dataToString($_data) . ')';
-                } elseif (is_object($_data)) {
-                    $object = new ReflectionObject($_data);
-
-                    if ($object->hasMethod('__toString')) {
-                        $result[] = (string) $_data;
-                    } else {
-                        $result[] = get_class($_data);
-                    }
-                } elseif (is_resource($_data)) {
-                    $result[] = '<resource>';
-                } else {
-                    $result[] = var_export($_data, true);
-                }
-            } catch (ErrorException $e) {
-                $result[] = '*RECURSION*';
-            }
-        }
-
-        restore_error_handler();
-
-        return join(', ', $result);
-    }
-
-    /**
      * Gets the data set description of a TestCase.
      *
      * @param  boolean $includeData
@@ -1733,8 +1692,10 @@ abstract class PHPUnit_Framework_TestCase extends PHPUnit_Framework_Assert imple
                 $buffer .= sprintf(' with data set "%s"', $this->dataName);
             }
 
+            $exporter = new Exporter;
+
             if ($includeData) {
-                $buffer .= sprintf(' (%s)', $this->dataToString($this->data));
+                $buffer .= sprintf(' (%s)', $exporter->shortenedRecursiveExport($this->data));
             }
         }
 
@@ -1793,7 +1754,9 @@ abstract class PHPUnit_Framework_TestCase extends PHPUnit_Framework_Assert imple
                 }
 
                 if (isset($passed[$dependency])) {
-                    if ($passed[$dependency]['size'] > $this->getSize()) {
+                    if ($passed[$dependency]['size'] != PHPUnit_Util_Test::UNKNOWN &&
+                        $this->getSize() != PHPUnit_Util_Test::UNKNOWN &&
+                        $passed[$dependency]['size'] > $this->getSize()) {
                         $this->result->addError(
                             $this,
                             new PHPUnit_Framework_SkippedTestError(
@@ -1955,5 +1918,157 @@ abstract class PHPUnit_Framework_TestCase extends PHPUnit_Framework_Assert imple
 
         $this->outputBufferingActive = false;
         $this->outputBufferingLevel  = ob_get_level();
+    }
+
+    private function snapshotGlobalState()
+    {
+        $backupGlobals = $this->backupGlobals === null || $this->backupGlobals === true;
+
+        if ($this->runTestInSeparateProcess || $this->inIsolation ||
+            (!$backupGlobals && !$this->backupStaticAttributes)) {
+            return;
+        }
+
+        $this->snapshot = $this->createGlobalStateSnapshot($backupGlobals);
+    }
+
+    private function restoreGlobalState()
+    {
+        if (!$this->snapshot instanceof Snapshot) {
+            return;
+        }
+
+        $backupGlobals = $this->backupGlobals === null || $this->backupGlobals === true;
+
+        if ($this->disallowChangesToGlobalState) {
+            $this->compareGlobalStateSnapshots(
+                $this->snapshot,
+                $this->createGlobalStateSnapshot($backupGlobals)
+            );
+        }
+
+        $restorer = new Restorer;
+
+        if ($backupGlobals) {
+            $restorer->restoreGlobalVariables($this->snapshot);
+        }
+
+        if ($this->backupStaticAttributes) {
+            $restorer->restoreStaticAttributes($this->snapshot);
+        }
+
+        $this->snapshot = null;
+    }
+
+    /**
+     * @param  boolean $backupGlobals
+     * @return Snapshot
+     */
+    private function createGlobalStateSnapshot($backupGlobals)
+    {
+        $blacklist = new Blacklist;
+
+        foreach ($this->backupGlobalsBlacklist as $globalVariable) {
+            $blacklist->addGlobalVariable($globalVariable);
+        }
+
+        if (!defined('PHPUNIT_TESTSUITE')) {
+            $blacklist->addClassNamePrefix('PHPUnit');
+            $blacklist->addClassNamePrefix('File_Iterator');
+            $blacklist->addClassNamePrefix('PHP_CodeCoverage');
+            $blacklist->addClassNamePrefix('PHP_Invoker');
+            $blacklist->addClassNamePrefix('PHP_Timer');
+            $blacklist->addClassNamePrefix('PHP_Token');
+            $blacklist->addClassNamePrefix('Symfony');
+            $blacklist->addClassNamePrefix('Text_Template');
+            $blacklist->addClassNamePrefix('Doctrine\Instantiator');
+
+            foreach ($this->backupStaticAttributesBlacklist as $class => $attributes) {
+                foreach ($attributes as $attribute) {
+                    $blacklist->addStaticAttribute($class, $attribute);
+                }
+            }
+        }
+
+        return new Snapshot(
+            $blacklist,
+            $backupGlobals,
+            $this->backupStaticAttributes,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+        );
+    }
+
+    /**
+     * @param  Snapshot $before
+     * @param  Snapshot $after
+     * @throws PHPUnit_Framework_RiskyTestError
+     */
+    private function compareGlobalStateSnapshots(Snapshot $before, Snapshot $after)
+    {
+        $backupGlobals = $this->backupGlobals === null || $this->backupGlobals === true;
+
+        if ($backupGlobals) {
+            $this->compareGlobalStateSnapshotPart(
+                $before->globalVariables(),
+                $after->globalVariables(),
+                "--- Global variables before the test\n+++ Global variables after the test\n"
+            );
+
+            $this->compareGlobalStateSnapshotPart(
+                $before->superGlobalVariables(),
+                $after->superGlobalVariables(),
+                "--- Super-global variables before the test\n+++ Super-global variables after the test\n"
+            );
+        }
+
+        if ($this->backupStaticAttributes) {
+            $this->compareGlobalStateSnapshotPart(
+                $before->staticAttributes(),
+                $after->staticAttributes(),
+                "--- Static attributes before the test\n+++ Static attributes after the test\n"
+            );
+        }
+    }
+
+    /**
+     * @param  array  $before
+     * @param  array  $after
+     * @param  string $header
+     * @throws PHPUnit_Framework_RiskyTestError
+     */
+    private function compareGlobalStateSnapshotPart(array $before, array $after, $header)
+    {
+        if ($before != $after) {
+            $differ   = new Differ($header);
+            $exporter = new Exporter;
+
+            $diff = $differ->diff(
+                $exporter->export($before),
+                $exporter->export($after)
+            );
+
+            throw new PHPUnit_Framework_RiskyTestError(
+                $diff
+            );
+        }
+    }
+
+    /**
+     * @return Prophecy\Prophet
+     * @since Method available since Release 4.5.0
+     */
+    private function getProphet()
+    {
+        if ($this->prophet === null) {
+            $this->prophet = new Prophet;
+        }
+
+        return $this->prophet;
     }
 }
